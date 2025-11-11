@@ -1,10 +1,11 @@
-use anyhow::{bail, Context, Error, Result};
-use crossterm::{cursor, terminal, QueueableCommand};
+use anyhow::{Context, Error, Result, bail};
+use crossterm::{QueueableCommand, cursor, terminal};
 use std::{
+    collections::HashSet,
     env,
     fs::{File, OpenOptions},
     io::{Read, Seek, StdoutLock, Write},
-    path::{Path, MAIN_SEPARATOR_STR},
+    path::{MAIN_SEPARATOR_STR, Path},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering::Relaxed},
@@ -16,7 +17,6 @@ use std::{
 use crate::{
     clear_terminal,
     cmd::CmdRunner,
-    collections::hash_set_with_capacity,
     embedded::EMBEDDED_FILES,
     exercise::{Exercise, RunnableExercise},
     info_file::ExerciseInfo,
@@ -60,8 +60,7 @@ pub struct AppState {
     file_buf: Vec<u8>,
     official_exercises: bool,
     cmd_runner: CmdRunner,
-    // Running in VS Code.
-    vs_code: bool,
+    emit_file_links: bool,
 }
 
 impl AppState {
@@ -146,7 +145,7 @@ impl AppState {
                 break 'block StateFileStatus::NotRead;
             }
 
-            let mut done_exercises = hash_set_with_capacity(exercises.len());
+            let mut done_exercises = HashSet::with_capacity(exercises.len());
 
             for done_exercise_name in lines {
                 if done_exercise_name.is_empty() {
@@ -181,7 +180,8 @@ impl AppState {
             file_buf,
             official_exercises: !Path::new("info.toml").exists(),
             cmd_runner,
-            vs_code: env::var_os("TERM_PROGRAM").is_some_and(|v| v == "vscode"),
+            // VS Code has its own file link handling
+            emit_file_links: env::var_os("TERM_PROGRAM").is_none_or(|v| v != "vscode"),
         };
 
         Ok((slf, state_file_status))
@@ -218,8 +218,8 @@ impl AppState {
     }
 
     #[inline]
-    pub fn vs_code(&self) -> bool {
-        self.vs_code
+    pub fn emit_file_links(&self) -> bool {
+        self.emit_file_links
     }
 
     // Write the state file.
@@ -315,7 +315,7 @@ impl AppState {
     }
 
     // Official exercises: Dump the original file from the binary.
-    // Third-party exercises: Reset the exercise file with `git stash`.
+    // Community exercises: Reset the exercise file with `git stash`.
     fn reset(&self, exercise_ind: usize, path: &str) -> Result<()> {
         if self.official_exercises {
             return EMBEDDED_FILES
@@ -385,7 +385,7 @@ impl AppState {
     }
 
     /// Official exercises: Dump the solution file from the binary and return its path.
-    /// Third-party exercises: Check if a solution file exists and return its path in that case.
+    /// Community exercises: Check if a solution file exists and return its path in that case.
     pub fn current_solution_path(&self) -> Result<Option<String>> {
         if cfg!(debug_assertions) {
             return Ok(None);
@@ -427,32 +427,34 @@ impl AppState {
                 let next_exercise_ind = &next_exercise_ind;
                 let slf = &self;
                 thread::Builder::new()
-                    .spawn_scoped(s, move || loop {
-                        let exercise_ind = next_exercise_ind.fetch_add(1, Relaxed);
-                        let Some(exercise) = slf.exercises.get(exercise_ind) else {
-                            // No more exercises.
-                            break;
-                        };
+                    .spawn_scoped(s, move || {
+                        loop {
+                            let exercise_ind = next_exercise_ind.fetch_add(1, Relaxed);
+                            let Some(exercise) = slf.exercises.get(exercise_ind) else {
+                                // No more exercises.
+                                break;
+                            };
 
-                        if exercise_progress_sender
-                            .send((exercise_ind, CheckProgress::Checking))
-                            .is_err()
-                        {
-                            break;
-                        };
+                            if exercise_progress_sender
+                                .send((exercise_ind, CheckProgress::Checking))
+                                .is_err()
+                            {
+                                break;
+                            };
 
-                        let success = exercise.run_exercise(None, &slf.cmd_runner);
-                        let progress = match success {
-                            Ok(true) => CheckProgress::Done,
-                            Ok(false) => CheckProgress::Pending,
-                            Err(_) => CheckProgress::None,
-                        };
+                            let success = exercise.run_exercise(None, &slf.cmd_runner);
+                            let progress = match success {
+                                Ok(true) => CheckProgress::Done,
+                                Ok(false) => CheckProgress::Pending,
+                                Err(_) => CheckProgress::None,
+                            };
 
-                        if exercise_progress_sender
-                            .send((exercise_ind, progress))
-                            .is_err()
-                        {
-                            break;
+                            if exercise_progress_sender
+                                .send((exercise_ind, progress))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                     })
                     .context("Failed to spawn a thread to check all exercises")?;
@@ -619,7 +621,7 @@ mod tests {
             file_buf: Vec::new(),
             official_exercises: true,
             cmd_runner: CmdRunner::build().unwrap(),
-            vs_code: false,
+            emit_file_links: true,
         };
 
         let mut assert = |done: [bool; 3], expected: [Option<usize>; 3]| {

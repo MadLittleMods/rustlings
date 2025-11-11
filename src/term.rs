@@ -1,8 +1,8 @@
 use crossterm::{
+    Command, QueueableCommand,
     cursor::MoveTo,
     style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{Clear, ClearType},
-    Command, QueueableCommand,
 };
 use std::{
     fmt, fs,
@@ -11,15 +11,15 @@ use std::{
 
 use crate::app_state::CheckProgress;
 
-pub struct MaxLenWriter<'a, 'b> {
-    pub stdout: &'a mut StdoutLock<'b>,
+pub struct MaxLenWriter<'a, 'lock> {
+    pub stdout: &'a mut StdoutLock<'lock>,
     len: usize,
     max_len: usize,
 }
 
-impl<'a, 'b> MaxLenWriter<'a, 'b> {
+impl<'a, 'lock> MaxLenWriter<'a, 'lock> {
     #[inline]
-    pub fn new(stdout: &'a mut StdoutLock<'b>, max_len: usize) -> Self {
+    pub fn new(stdout: &'a mut StdoutLock<'lock>, max_len: usize) -> Self {
         Self {
             stdout,
             len: 0,
@@ -34,13 +34,13 @@ impl<'a, 'b> MaxLenWriter<'a, 'b> {
     }
 }
 
-pub trait CountedWrite<'a> {
+pub trait CountedWrite<'lock> {
     fn write_ascii(&mut self, ascii: &[u8]) -> io::Result<()>;
     fn write_str(&mut self, unicode: &str) -> io::Result<()>;
-    fn stdout(&mut self) -> &mut StdoutLock<'a>;
+    fn stdout(&mut self) -> &mut StdoutLock<'lock>;
 }
 
-impl<'a, 'b> CountedWrite<'b> for MaxLenWriter<'a, 'b> {
+impl<'lock> CountedWrite<'lock> for MaxLenWriter<'_, 'lock> {
     fn write_ascii(&mut self, ascii: &[u8]) -> io::Result<()> {
         let n = ascii.len().min(self.max_len.saturating_sub(self.len));
         if n > 0 {
@@ -65,7 +65,7 @@ impl<'a, 'b> CountedWrite<'b> for MaxLenWriter<'a, 'b> {
     }
 
     #[inline]
-    fn stdout(&mut self) -> &mut StdoutLock<'b> {
+    fn stdout(&mut self) -> &mut StdoutLock<'lock> {
         self.stdout
     }
 }
@@ -87,17 +87,17 @@ impl<'a> CountedWrite<'a> for StdoutLock<'a> {
     }
 }
 
-pub struct CheckProgressVisualizer<'a, 'b> {
-    stdout: &'a mut StdoutLock<'b>,
+pub struct CheckProgressVisualizer<'a, 'lock> {
+    stdout: &'a mut StdoutLock<'lock>,
     n_cols: usize,
 }
 
-impl<'a, 'b> CheckProgressVisualizer<'a, 'b> {
+impl<'a, 'lock> CheckProgressVisualizer<'a, 'lock> {
     const CHECKING_COLOR: Color = Color::Blue;
     const DONE_COLOR: Color = Color::Green;
     const PENDING_COLOR: Color = Color::Red;
 
-    pub fn build(stdout: &'a mut StdoutLock<'b>, term_width: u16) -> io::Result<Self> {
+    pub fn build(stdout: &'a mut StdoutLock<'lock>, term_width: u16) -> io::Result<Self> {
         clear_terminal(stdout)?;
         stdout.write_all("Checking all exercises…\n".as_bytes())?;
 
@@ -157,6 +157,37 @@ impl<'a, 'b> CheckProgressVisualizer<'a, 'b> {
         }
 
         self.stdout.flush()
+    }
+}
+
+pub struct ProgressCounter<'a, 'lock> {
+    stdout: &'a mut StdoutLock<'lock>,
+    total: usize,
+    counter: usize,
+}
+
+impl<'a, 'lock> ProgressCounter<'a, 'lock> {
+    pub fn new(stdout: &'a mut StdoutLock<'lock>, total: usize) -> io::Result<Self> {
+        write!(stdout, "Progress: 0/{total}")?;
+        stdout.flush()?;
+
+        Ok(Self {
+            stdout,
+            total,
+            counter: 0,
+        })
+    }
+
+    pub fn increment(&mut self) -> io::Result<()> {
+        self.counter += 1;
+        write!(self.stdout, "\rProgress: {}/{}", self.counter, self.total)?;
+        self.stdout.flush()
+    }
+}
+
+impl Drop for ProgressCounter<'_, '_> {
+    fn drop(&mut self) {
+        let _ = self.stdout.write_all(b"\n\n");
     }
 }
 
@@ -241,28 +272,37 @@ pub fn canonicalize(path: &str) -> Option<String> {
         })
 }
 
-pub fn terminal_file_link<'a>(
-    writer: &mut impl CountedWrite<'a>,
-    path: &str,
-    canonical_path: &str,
+pub fn file_path<'a, W: CountedWrite<'a>>(
+    writer: &mut W,
     color: Color,
+    f: impl FnOnce(&mut W) -> io::Result<()>,
 ) -> io::Result<()> {
     writer
         .stdout()
         .queue(SetForegroundColor(color))?
         .queue(SetAttribute(Attribute::Underlined))?;
-    writer.stdout().write_all(b"\x1b]8;;file://")?;
-    writer.stdout().write_all(canonical_path.as_bytes())?;
-    writer.stdout().write_all(b"\x1b\\")?;
-    // Only this part is visible.
-    writer.write_str(path)?;
-    writer.stdout().write_all(b"\x1b]8;;\x1b\\")?;
+
+    f(writer)?;
+
     writer
         .stdout()
         .queue(SetForegroundColor(Color::Reset))?
         .queue(SetAttribute(Attribute::NoUnderline))?;
 
     Ok(())
+}
+
+pub fn terminal_file_link<'a>(
+    writer: &mut impl CountedWrite<'a>,
+    path: &str,
+    canonical_path: &str,
+) -> io::Result<()> {
+    writer.stdout().write_all(b"\x1b]8;;file://")?;
+    writer.stdout().write_all(canonical_path.as_bytes())?;
+    writer.stdout().write_all(b"\x1b\\")?;
+    // Only this part is visible.
+    writer.write_str(path)?;
+    writer.stdout().write_all(b"\x1b]8;;\x1b\\")
 }
 
 pub fn write_ansi(output: &mut Vec<u8>, command: impl Command) {
